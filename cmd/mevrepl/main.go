@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -20,12 +21,13 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/flashbots/mevrepl/mev"
 	"github.com/flashbots/mevrepl/mevutil"
+	"github.com/holiman/uint256"
 	"github.com/urfave/cli/v2"
 )
 
 var (
 	errHintNotFound          = errors.New("hint hash not found")
-	errUnsupportedTestTxType = errors.New("unsupported test-tx-type")
+	errUnsupportedTestTxType = errors.New("unsupported tx-type")
 )
 
 type TestTxType string
@@ -34,6 +36,7 @@ const (
 	WethWrap   TestTxType = "weth-wrap"
 	BuilderTip TestTxType = "builder-tip"
 	FakeTx     TestTxType = "fake-tx"
+	EIP7702Tx  TestTxType = "eip7702-tx"
 )
 
 var (
@@ -47,7 +50,8 @@ var (
 			Aliases: []string{"tt"},
 			Usage: "--tt weth-wrap. " +
 				"--tt builder-tip. " +
-				"--tt fake-tx (send failed tx -> send bundle matching failed tx (Test case))",
+				"--tt fake-tx (send failed tx -> send bundle matching failed tx (Test case))" +
+				"--tt eip7702-tx (send eip7702 tx)",
 		},
 	}
 
@@ -88,6 +92,9 @@ func main() {
 		builderAddr          common.Address
 		wethAddr             common.Address
 		checkAndSendContract common.Address
+
+		// pectra
+		batchcallAndSponsorContract common.Address
 	)
 
 	switch network {
@@ -95,13 +102,17 @@ func main() {
 		network = mev.SepoliaNetwork
 		priorityFee = big.NewInt(1e5)
 		if publicRPCURL == "" {
-			publicRPCURL = "https://eth-sepolia.public.blastapi.io"
+			publicRPCURL = "https://ethereum-sepolia-rpc.publicnode.com"
+			//publicRPCURL = "https://eth-sepolia.public.blastapi.io"
+			//publicRPCURL = "http://localhost:8545"
 		}
 		chainID = big.NewInt(mev.SepoliaChainID)
 
 		builderAddr = common.HexToAddress("0x13cb6ae34a13a0977f4d7101ebc24b87bb23f0d5")
 		wethAddr = common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14")
 		checkAndSendContract = common.HexToAddress("0xB0D90094d296DA87485C623a7f42d245A74036a0")
+
+		batchcallAndSponsorContract = common.HexToAddress("0x33ACD5b112a17c863beb2f37f785bAEf8a8f8369")
 	case mev.Mainnet:
 		if publicRPCURL == "" {
 			publicRPCURL = "https://eth.llamarpc.com"
@@ -130,13 +141,14 @@ func main() {
 	defer cancel()
 
 	mevTest := &MEVTest{
-		mevClient:            mevClient,
-		ethClient:            ethClient,
-		alice:                alice,
-		network:              network,
-		builderAddr:          builderAddr,
-		wethAddr:             wethAddr,
-		checkAndSendContract: checkAndSendContract,
+		mevClient:                   mevClient,
+		ethClient:                   ethClient,
+		alice:                       alice,
+		network:                     network,
+		builderAddr:                 builderAddr,
+		wethAddr:                    wethAddr,
+		checkAndSendContract:        checkAndSendContract,
+		batchCallAndSponsorContract: batchcallAndSponsorContract,
 	}
 
 	app := &cli.App{
@@ -174,7 +186,149 @@ func main() {
 				return err
 			}
 
-			_, err = mevTest.SendPrivateSimpleTx(ctx, ethAmount, toAddr, priorityFee)
+			// Pectra update test workflow using batch call transactions
+			//
+			// 1. construct and send SetCode transaction
+			// 2. get tx_receipt and verify that auth set correctly
+			// 3. use EOA account to execute tx batchcall
+			if txTypeStr == EIP7702Tx {
+				tx, err := mevTest.delegateTxWithEIP7702(ctx, nil, priorityFee)
+				if err != nil {
+					return fmt.Errorf("failed to construct eip7702 tx error %w", err)
+				}
+
+				slog.Info("Sent eip7702-tx", "tx_hash", tx.Hash())
+
+				if err := mevTest.mevClient.SendPrivateTx(ctx, tx); err != nil {
+					return err
+				}
+
+				matchHash, err := mevutil.DoubleTxHash(tx.Hash())
+				if err != nil {
+					return err
+				}
+
+				rawKeyY := os.Getenv("FLASHBOTS_ETH_PRIVATE_KEY_2")
+				if rawKeyY == "" {
+					return errors.New("FLASHBOTS_ETH_PRIVATE_KEY_2 must be provided")
+				}
+
+				privKey2, err := crypto.HexToECDSA(rawKeyY)
+				if err != nil {
+					return fmt.Errorf("failed to parse secp256k1 private key error %w", err)
+				}
+
+				bundleResp, err := mevTest.SendTestBackrun(ctx, matchHash, priorityFee, ethAmount, privKey2)
+				if err != nil {
+					return fmt.Errorf("failed to send backrun error %w", err)
+				}
+
+				slog.Info("Sent Bundle", "bundle_hash", bundleResp.BundleHash)
+
+				// verify auth
+			VerifyLoop:
+				for {
+					<-time.After(time.Second * 2)
+					onchainTx, pending, err := ethClient.TransactionByHash(ctx, tx.Hash())
+					if err != nil {
+						if errors.Is(err, ethereum.NotFound) {
+							continue
+						}
+						return err
+					}
+
+					if pending {
+						continue
+					}
+
+					for _, auth := range onchainTx.SetCodeAuthorizations() {
+						code, err := ethClient.CodeAt(ctx, crypto.PubkeyToAddress(alice.PublicKey), nil)
+						if err != nil {
+							return err
+						}
+						delegation := types.AddressToDelegation(auth.Address)
+						if string(code) != string(delegation) {
+							return fmt.Errorf("code is not equal expected delegation")
+						}
+						break VerifyLoop
+					}
+				}
+
+				batchCallABI, err := abi.JSON(strings.NewReader(mevutil.BatchCallAndSponsorABI))
+				if err != nil {
+					return err
+				}
+
+				calldata, err := batchCallABI.Pack("execute", []Call{
+					{
+						To:    wethAddr,
+						Value: big.NewInt(1),
+						Data:  nil,
+					},
+					{
+						To:    builderAddr,
+						Value: big.NewInt(2e17),
+						Data:  nil,
+					},
+				})
+				if err != nil {
+					return fmt.Errorf("failed to pack batchcall error %w", err)
+				}
+
+				currBlock, err := ethClient.BlockByNumber(ctx, nil)
+				if err != nil {
+					return err
+				}
+
+				senderAddr := crypto.PubkeyToAddress(alice.PublicKey)
+				nonce, err := ethClient.PendingNonceAt(ctx, senderAddr)
+				if err != nil {
+					return err
+				}
+
+				signer := types.LatestSignerForChainID(mevTest.mevClient.ChainID)
+				gasPrice := currBlock.BaseFee()
+				baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(110))
+				baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
+				gasLimit := 180_000
+
+				var gasTipCap *big.Int
+				if priorityFee != nil {
+					gasTipCap = priorityFee
+				} else {
+					gasTipCap = big.NewInt(1e5)
+				}
+
+				rawTx := types.NewTx(&types.DynamicFeeTx{
+					ChainID:   mevTest.mevClient.ChainID,
+					Nonce:     nonce,
+					GasTipCap: gasTipCap,
+					GasFeeCap: baseFeeFuture,
+					Gas:       uint64(gasLimit),
+					To:        &senderAddr,
+					Value:     nil,
+					Data:      calldata,
+				})
+
+				stx, err := types.SignTx(rawTx, signer, alice)
+				if err != nil {
+					return err
+				}
+
+				if err := mevTest.mevClient.SendPrivateTx(ctx, stx); err != nil {
+					return err
+				}
+
+				slog.Info("Sent batchcall-tx", "tx_hash", stx.Hash())
+				return nil
+			}
+
+			tx, err := mevTest.ethTransfer(ctx, ethAmount, priorityFee, nil, toAddr)
+			if err != nil {
+				return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
+			}
+
+			_, err = mevTest.SendPrivateSimpleTx(ctx, tx)
 			if err != nil {
 				return fmt.Errorf("faield to execute send-private-tx error %w", err)
 			}
@@ -324,7 +478,11 @@ func main() {
 			if txTypeStr == FakeTx {
 				tx, err = mevTest.SendFakeTx(ctx, nil, priorityFee)
 			} else {
-				tx, err = mevTest.SendPrivateSimpleTx(ctx, big.NewInt(1), toAddr, priorityFee)
+				tx, err = mevTest.ethTransfer(ctx, big.NewInt(1), priorityFee, nil, toAddr)
+				if err != nil {
+					return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
+				}
+				tx, err = mevTest.SendPrivateSimpleTx(ctx, tx)
 
 			}
 			if err != nil {
@@ -379,13 +537,14 @@ func main() {
 }
 
 type MEVTest struct {
-	alice                *ecdsa.PrivateKey
-	mevClient            *mev.Client
-	ethClient            *ethclient.Client
-	network              string
-	builderAddr          common.Address
-	wethAddr             common.Address
-	checkAndSendContract common.Address
+	alice                       *ecdsa.PrivateKey
+	mevClient                   *mev.Client
+	ethClient                   *ethclient.Client
+	network                     string
+	builderAddr                 common.Address
+	wethAddr                    common.Address
+	checkAndSendContract        common.Address
+	batchCallAndSponsorContract common.Address
 }
 
 func (mt *MEVTest) getEthValue(value string) (*big.Int, error) {
@@ -405,6 +564,8 @@ func (mt *MEVTest) parseToAddr(txType TestTxType) (common.Address, error) {
 		return mt.wethAddr, nil
 	case BuilderTip:
 		return mt.builderAddr, nil
+	case EIP7702Tx:
+		return common.Address{}, nil
 
 	default:
 		return common.Address{}, errUnsupportedTestTxType
@@ -450,6 +611,67 @@ func (mt *MEVTest) ethTransfer(ctx context.Context, value *big.Int, priorityFee 
 		To:        &to,
 		Value:     value,
 	}), signer, key)
+}
+
+type Call struct {
+	To    common.Address `json:"to"`
+	Value *big.Int       `json:"value"`
+	Data  []byte         `json:"data"`
+}
+
+func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.PrivateKey, priorityFee *big.Int) (*types.Transaction, error) {
+	if sender == nil {
+		sender = mt.alice
+	}
+
+	currBlock, err := mt.ethClient.BlockByNumber(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	senderAddr := crypto.PubkeyToAddress(sender.PublicKey)
+	nonce, err := mt.ethClient.PendingNonceAt(ctx, senderAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get nonce error %w", err)
+	}
+
+	//generate signature for specific contract implementation
+	auth, err := types.SignSetCode(sender, types.SetCodeAuthorization{
+		ChainID: *uint256.MustFromBig(mt.mevClient.ChainID),
+		Address: mt.batchCallAndSponsorContract,
+
+		Nonce: nonce + 1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign auth error %w", err)
+	}
+
+	signer := types.LatestSignerForChainID(mt.mevClient.ChainID)
+	gasPrice := currBlock.BaseFee()
+	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(110))
+	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
+	gasLimit := 180_000
+
+	var gasTipCap *big.Int
+	if priorityFee != nil {
+		gasTipCap = priorityFee
+	} else {
+		gasTipCap = big.NewInt(1e5)
+	}
+
+	rawTx := types.NewTx(&types.SetCodeTx{
+		ChainID:   uint256.MustFromBig(mt.mevClient.ChainID),
+		Nonce:     nonce,
+		GasTipCap: uint256.MustFromBig(gasTipCap),
+		GasFeeCap: uint256.MustFromBig(baseFeeFuture),
+		Gas:       uint64(gasLimit),
+		To:        senderAddr,
+		Value:     nil,
+		Data:      []byte("hello!"),
+		AuthList:  []types.SetCodeAuthorization{auth},
+	})
+
+	return types.SignTx(rawTx, signer, sender)
 }
 
 func (mt *MEVTest) SendFakeTx(ctx context.Context, sender *ecdsa.PrivateKey, priorityFee *big.Int) (*types.Transaction, error) {
@@ -508,12 +730,7 @@ func (mt *MEVTest) SendFakeTx(ctx context.Context, sender *ecdsa.PrivateKey, pri
 	return fakeTx, nil
 }
 
-func (mt *MEVTest) SendPrivateSimpleTx(ctx context.Context, eth *big.Int, to common.Address, priorityFee *big.Int) (*types.Transaction, error) {
-	tx, err := mt.ethTransfer(ctx, eth, priorityFee, nil, to)
-	if err != nil {
-		return nil, err
-	}
-
+func (mt *MEVTest) SendPrivateSimpleTx(ctx context.Context, tx *types.Transaction) (*types.Transaction, error) {
 	if err := mt.mevClient.SendPrivateTx(ctx, tx); err != nil {
 		return nil, err
 	}
