@@ -197,6 +197,19 @@ func main() {
 					return fmt.Errorf("failed to construct eip7702 tx error %w", err)
 				}
 
+				listenCtx, stopListen := context.WithTimeout(ctx, time.Second*60)
+				defer stopListen()
+				hintsC := make(chan mev.Hint, 100)
+				_, err = mev.SubscribeHints(listenCtx, mevClient.FlashbotsMEVShareURL, hintsC, nil)
+				if err != nil {
+					return err
+				}
+				go func() {
+					<-listenCtx.Done()
+					<-time.After(time.Second * 1)
+					close(hintsC)
+				}()
+
 				slog.Info("Sent eip7702-tx", "tx_hash", tx.Hash())
 
 				if err := mevTest.mevClient.SendPrivateTx(ctx, tx); err != nil {
@@ -218,12 +231,18 @@ func main() {
 					return fmt.Errorf("failed to parse secp256k1 private key error %w", err)
 				}
 
-				bundleResp, err := mevTest.SendTestBackrun(ctx, matchHash, priorityFee, ethAmount, privKey2)
-				if err != nil {
-					return fmt.Errorf("failed to send backrun error %w", err)
-				}
+				for hint := range hintsC {
+					if hint.Hash == matchHash {
+						bundleResp, err := mevTest.SendTestBackrun(ctx, matchHash, priorityFee, ethAmount, privKey2)
+						if err != nil {
+							return fmt.Errorf("failed to send backrun error %w", err)
+						}
 
-				slog.Info("Sent Bundle", "bundle_hash", bundleResp.BundleHash)
+						slog.Info("Sent Bundle", "bundle_hash", bundleResp.BundleHash)
+						stopListen()
+						break
+					}
+				}
 
 				// verify auth
 			VerifyLoop:
@@ -267,7 +286,7 @@ func main() {
 					},
 					{
 						To:    builderAddr,
-						Value: big.NewInt(2e17),
+						Value: big.NewInt(1),
 						Data:  nil,
 					},
 				})
