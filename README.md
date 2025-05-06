@@ -7,7 +7,7 @@ decoding, backrunning, and private transaction submission
 
 ## Supported Commands
 
-### [send-private-tx]((https://github.com/flashbots/mevrepl/blob/04e7d7a43df6a4bc33f08f75525ccb5cf3eb1a90/cmd/mevrepl/main.go#L171))
+### [send-private-tx](https://github.com/flashbots/mevrepl/blob/04e7d7a43df6a4bc33f08f75525ccb5cf3eb1a90/cmd/mevrepl/main.go#L171)
 
 Sends a test private transaction using
 the [Flashbots Protect RPC endpoint](https://docs.flashbots.net/flashbots-protect/overview).  
