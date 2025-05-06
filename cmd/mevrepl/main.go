@@ -103,8 +103,6 @@ func main() {
 		priorityFee = big.NewInt(1e5)
 		if publicRPCURL == "" {
 			publicRPCURL = "https://ethereum-sepolia-rpc.publicnode.com"
-			//publicRPCURL = "https://eth-sepolia.public.blastapi.io"
-			//publicRPCURL = "http://localhost:8545"
 		}
 		chainID = big.NewInt(mev.SepoliaChainID)
 
@@ -123,6 +121,8 @@ func main() {
 		builderAddr = common.HexToAddress("0xdadB0d80178819F2319190D340ce9A924f783711")
 		wethAddr = common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
 		checkAndSendContract = common.HexToAddress("0xC4595E3966e0Ce6E3c46854647611940A09448d3")
+
+		batchcallAndSponsorContract = common.HexToAddress("0x775c8D470CC8d4530b8F233322480649f4FAb758")
 	default:
 		panic("unsupported network")
 	}
