@@ -16,8 +16,7 @@ import (
 const (
 	maxConnAttempts = 3
 
-	defaultPingInterval       = time.Second * 15
-	defaultConnRequestTimeout = time.Second * 3
+	defaultPingInterval = time.Second * 15
 )
 
 var (
@@ -29,18 +28,13 @@ type SubscriptionOpts struct {
 	// before considering the connection as stale or unresponsive.
 	PingInterval time.Duration
 
-	// ConnRetryTimeout specifies the duration to wait before retrying to establish a connection
-	// if the initial connection attempt fails
-	ConnRetryTimeout time.Duration
-
 	MaxConnAttempts int
 }
 
 func DefaultSubOpts() *SubscriptionOpts {
 	return &SubscriptionOpts{
-		PingInterval:     defaultPingInterval,
-		ConnRetryTimeout: defaultConnRequestTimeout,
-		MaxConnAttempts:  maxConnAttempts,
+		PingInterval:    defaultPingInterval,
+		MaxConnAttempts: maxConnAttempts,
 	}
 }
 
@@ -74,11 +68,9 @@ func SubscribeHints(ctx context.Context, url string, ch chan<- Hint, opts *Subsc
 		hintsC: ch,
 	}
 
-	go func() {
-		if err := s.subscribe(ctx); err != nil {
-			s.connErr.Store(err)
-		}
-	}()
+	if err := s.subscribe(ctx); err != nil {
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -93,24 +85,34 @@ func (stream *Stream) Error() error {
 }
 
 func (stream *Stream) subscribe(ctx context.Context) error {
-	streamCtx, cancelSub := context.WithCancel(ctx)
-	defer cancelSub()
-
 	conn := func() (*http.Response, error) {
+		var lastErr error
 		req := new(http.Request)
 		*req = stream.req
-		req = req.WithContext(streamCtx)
+		req = req.WithContext(ctx)
+		for attempts := 0; attempts < maxConnAttempts; attempts++ {
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				// means client closed the stream
+				if errors.Is(err, context.Canceled) {
+					return nil, err
+				}
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("init stream connection request failed error %w", err)
+				lastErr = err
+				<-time.After(time.Second * 1)
+				continue
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				lastErr = fmt.Errorf("init stream connection request failed. Status not 200")
+				<-time.After(time.Second * 1)
+				continue
+			}
+
+			return resp, nil
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("init stream connection request failed. Status not 200")
-		}
-
-		return resp, nil
+		return nil, errors.Join(ErrMaxConnAttemptsExceeded, lastErr)
 	}
 
 	var (
@@ -118,77 +120,69 @@ func (stream *Stream) subscribe(ctx context.Context) error {
 		ping     = []byte("ping:")
 
 		readerBuff = make([]byte, bufio.MaxScanTokenSize*2)
-
-		connAttempts int
 	)
-	for {
-		resp, err := conn()
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				break
-			}
-			connAttempts++
 
-			if connAttempts >= stream.opts.MaxConnAttempts {
-				cancelSub()
-				return errors.Join(ErrMaxConnAttemptsExceeded, err)
-			}
-
-			<-time.After(stream.opts.ConnRetryTimeout)
-			continue
-		}
-		// reset attempts after successfully connected
-		connAttempts = 0
-
-		reader := bufio.NewScanner(resp.Body)
-		reader.Split(bufio.ScanLines)
-		reader.Buffer(readerBuff, bufio.MaxScanTokenSize*2)
-
-		for reader.Scan() {
-			payload := reader.Bytes()
-			if len(payload) == 0 {
-				continue
-			}
-
-			if bytes.Contains(payload, ping) {
-				continue
-			}
-
-			var valid bool
-			payload, valid = bytes.CutPrefix(payload, dataPref)
-			if !valid {
-				slog.Debug("Token doesn't contain required prefix. Some data can be lost")
-				continue
-			}
-
-			var hint Hint
-			if err := json.Unmarshal(payload, &hint); err != nil {
-				return fmt.Errorf("failed to unmarshal hint object error %w", err)
-			}
-			stream.hintsC <- hint
-		}
-
-		_ = resp.Body.Close()
-
-		if readerErr := reader.Err(); readerErr != nil {
-			// means client closed the stream
-			// exit point
-			if errors.Is(readerErr, context.Canceled) {
-				break
-			}
-
-			if errors.Is(readerErr, bufio.ErrTooLong) {
-				slog.Debug("Failed to scan. Token is too large. Some data can be lost")
-				continue
-			}
-
-			slog.Debug("Failed to scan. Reader closed some data can be lost.", "error", readerErr)
-			continue
-		}
-
-		// readerErr is nil (EOF occurred reading data from resp body)
-		// means connection closed by server. Reconnecting
+	resp, err := conn()
+	if err != nil {
+		stream.connErr.Store(err)
+		return err
 	}
+
+	go func() {
+		for {
+			reader := bufio.NewScanner(resp.Body)
+			reader.Split(bufio.ScanLines)
+			reader.Buffer(readerBuff, bufio.MaxScanTokenSize*2)
+
+			for reader.Scan() {
+				payload := reader.Bytes()
+				if len(payload) == 0 {
+					continue
+				}
+
+				if bytes.Contains(payload, ping) {
+					continue
+				}
+
+				var valid bool
+				payload, valid = bytes.CutPrefix(payload, dataPref)
+				if !valid {
+					slog.Debug("Token doesn't contain required prefix. Some data can be lost")
+					continue
+				}
+
+				var hint Hint
+				if err := json.Unmarshal(payload, &hint); err != nil {
+					panic(fmt.Errorf("failed to unmarshal hint object error %w", err))
+				}
+				stream.hintsC <- hint
+			}
+
+			_ = resp.Body.Close()
+
+			if readerErr := reader.Err(); readerErr != nil {
+				// means client closed the stream
+				// exit point
+				if errors.Is(readerErr, context.Canceled) {
+					return
+				}
+
+				if errors.Is(readerErr, bufio.ErrTooLong) {
+					slog.Debug("Failed to scan. Token is too large. Some data can be lost")
+				}
+
+				slog.Debug("Failed to scan. Reader closed some data can be lost.", "error", readerErr)
+			}
+
+			// readerErr is nil (EOF occurred reading data from resp body)
+			// means connection closed by server. Reconnecting
+			resp, err = conn()
+			if err != nil {
+				stream.connErr.Store(err)
+				return
+			}
+		}
+	}()
 
 	return nil
 }
