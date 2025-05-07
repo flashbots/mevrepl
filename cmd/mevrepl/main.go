@@ -37,6 +37,7 @@ const (
 	BuilderTip TestTxType = "builder-tip"
 	FakeTx     TestTxType = "fake-tx"
 	EIP7702Tx  TestTxType = "eip7702-tx"
+	RawBatchTx TestTxType = "raw-batch-tx"
 )
 
 var (
@@ -186,13 +187,46 @@ func main() {
 				return err
 			}
 
+			if txTypeStr == RawBatchTx {
+				addr := crypto.PubkeyToAddress(alice.PublicKey)
+
+				nonceAt, err := mevTest.ethClient.PendingNonceAt(ctx, addr)
+				if err != nil {
+					return err
+				}
+
+				tx1, err := mevTest.delegateTxWithEIP7702(ctx, nil, priorityFee, &nonceAt)
+				if err != nil {
+					return err
+				}
+
+				nonceAt += 2
+				tx2, err := mevTest.delegateTxWithEIP7702(ctx, nil, priorityFee, &nonceAt)
+				if err != nil {
+					return err
+				}
+
+				if err := mevTest.mevClient.SendPrivateTx(ctx, tx1); err != nil {
+					return err
+				}
+
+				if err := mevTest.mevClient.SendPrivateTx(ctx, tx2); err != nil {
+					return err
+				}
+
+				slog.Info("Sent tx", "hash", tx1.Hash())
+				slog.Info("Sent tx", "hash", tx2.Hash())
+
+				return nil
+			}
+
 			// Pectra update test workflow using batch call transactions
 			//
 			// 1. construct and send SetCode transaction
 			// 2. get tx_receipt and verify that auth set correctly
 			// 3. use EOA account to execute tx batchcall
 			if txTypeStr == EIP7702Tx {
-				tx, err := mevTest.delegateTxWithEIP7702(ctx, nil, priorityFee)
+				tx, err := mevTest.delegateTxWithEIP7702(ctx, nil, priorityFee, nil)
 				if err != nil {
 					return fmt.Errorf("failed to construct eip7702 tx error %w", err)
 				}
@@ -204,6 +238,10 @@ func main() {
 				if err != nil {
 					return err
 				}
+
+				// todo: improve stream client impl
+				<-time.After(time.Second * 5)
+
 				go func() {
 					<-listenCtx.Done()
 					<-time.After(time.Second * 1)
@@ -231,6 +269,7 @@ func main() {
 					return fmt.Errorf("failed to parse secp256k1 private key error %w", err)
 				}
 
+				var found bool
 				for hint := range hintsC {
 					if hint.Hash == matchHash {
 						bundleResp, err := mevTest.SendTestBackrun(ctx, matchHash, priorityFee, ethAmount, privKey2)
@@ -240,10 +279,23 @@ func main() {
 
 						slog.Info("Sent Bundle", "bundle_hash", bundleResp.BundleHash)
 						stopListen()
+						found = true
 						break
 					}
 				}
 
+				if !found {
+					return errors.New("failed to send backrun")
+				}
+
+				txStatus, err := mevTest.getFlashbotsTxReceipt(ctx, tx.Hash())
+				if err != nil {
+					return err
+				}
+
+				slog.Info("Received tx status", "tx", tx.Hash(), "status", txStatus.Status)
+
+				slog.Info("Start verify auth_list")
 				// verify auth
 			VerifyLoop:
 				for {
@@ -307,7 +359,7 @@ func main() {
 
 				signer := types.LatestSignerForChainID(mevTest.mevClient.ChainID)
 				gasPrice := currBlock.BaseFee()
-				baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(110))
+				baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(150))
 				baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
 				gasLimit := 180_000
 
@@ -342,7 +394,7 @@ func main() {
 				return nil
 			}
 
-			tx, err := mevTest.ethTransfer(ctx, ethAmount, priorityFee, nil, toAddr)
+			tx, err := mevTest.ethTransfer(ctx, ethAmount, priorityFee, nil, toAddr, nil)
 			if err != nil {
 				return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
 			}
@@ -351,6 +403,13 @@ func main() {
 			if err != nil {
 				return fmt.Errorf("faield to execute send-private-tx error %w", err)
 			}
+
+			txStatus, err := mevTest.getFlashbotsTxReceipt(ctx, tx.Hash())
+			if err != nil {
+				return err
+			}
+
+			slog.Info("Received tx status", "tx", tx, "status", txStatus.Status)
 
 			return nil
 		},
@@ -497,7 +556,7 @@ func main() {
 			if txTypeStr == FakeTx {
 				tx, err = mevTest.SendFakeTx(ctx, nil, priorityFee)
 			} else {
-				tx, err = mevTest.ethTransfer(ctx, big.NewInt(1), priorityFee, nil, toAddr)
+				tx, err = mevTest.ethTransfer(ctx, big.NewInt(1), priorityFee, nil, toAddr, nil)
 				if err != nil {
 					return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
 				}
@@ -583,7 +642,7 @@ func (mt *MEVTest) parseToAddr(txType TestTxType) (common.Address, error) {
 		return mt.wethAddr, nil
 	case BuilderTip:
 		return mt.builderAddr, nil
-	case EIP7702Tx:
+	case EIP7702Tx, RawBatchTx:
 		return common.Address{}, nil
 
 	default:
@@ -591,7 +650,7 @@ func (mt *MEVTest) parseToAddr(txType TestTxType) (common.Address, error) {
 	}
 }
 
-func (mt *MEVTest) ethTransfer(ctx context.Context, value *big.Int, priorityFee *big.Int, sender *ecdsa.PrivateKey, to common.Address) (*types.Transaction, error) {
+func (mt *MEVTest) ethTransfer(ctx context.Context, value *big.Int, priorityFee *big.Int, sender *ecdsa.PrivateKey, to common.Address, nonce *uint64) (*types.Transaction, error) {
 	key := mt.alice
 	if sender != nil {
 		key = sender
@@ -603,9 +662,12 @@ func (mt *MEVTest) ethTransfer(ctx context.Context, value *big.Int, priorityFee 
 	}
 
 	address := crypto.PubkeyToAddress(key.PublicKey)
-	nonce, err := mt.mevClient.FlashbotsRPC.PendingNonceAt(ctx, address)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pending nonce: %w", err)
+	if nonce == nil {
+		nonceAt, err := mt.mevClient.FlashbotsRPC.PendingNonceAt(ctx, address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pending nonce: %w", err)
+		}
+		nonce = &nonceAt
 	}
 
 	signer := types.LatestSignerForChainID(mt.mevClient.ChainID)
@@ -623,7 +685,7 @@ func (mt *MEVTest) ethTransfer(ctx context.Context, value *big.Int, priorityFee 
 
 	return types.SignTx(types.NewTx(&types.DynamicFeeTx{
 		ChainID:   mt.mevClient.ChainID,
-		Nonce:     nonce,
+		Nonce:     *nonce,
 		GasFeeCap: baseFeeFuture,
 		GasTipCap: gasTipCap,
 		Gas:       uint64(gasLimit),
@@ -638,7 +700,7 @@ type Call struct {
 	Data  []byte         `json:"data"`
 }
 
-func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.PrivateKey, priorityFee *big.Int) (*types.Transaction, error) {
+func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.PrivateKey, priorityFee *big.Int, nonce *uint64) (*types.Transaction, error) {
 	if sender == nil {
 		sender = mt.alice
 	}
@@ -649,9 +711,12 @@ func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priv
 	}
 
 	senderAddr := crypto.PubkeyToAddress(sender.PublicKey)
-	nonce, err := mt.ethClient.PendingNonceAt(ctx, senderAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get nonce error %w", err)
+	if nonce == nil {
+		nonceAt, err := mt.ethClient.PendingNonceAt(ctx, senderAddr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get nonce error %w", err)
+		}
+		nonce = &nonceAt
 	}
 
 	//generate signature for specific contract implementation
@@ -659,7 +724,7 @@ func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priv
 		ChainID: *uint256.MustFromBig(mt.mevClient.ChainID),
 		Address: mt.batchCallAndSponsorContract,
 
-		Nonce: nonce + 1,
+		Nonce: *nonce + 1,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign auth error %w", err)
@@ -667,7 +732,7 @@ func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priv
 
 	signer := types.LatestSignerForChainID(mt.mevClient.ChainID)
 	gasPrice := currBlock.BaseFee()
-	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(110))
+	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(150))
 	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
 	gasLimit := 180_000
 
@@ -680,7 +745,7 @@ func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priv
 
 	rawTx := types.NewTx(&types.SetCodeTx{
 		ChainID:   uint256.MustFromBig(mt.mevClient.ChainID),
-		Nonce:     nonce,
+		Nonce:     *nonce,
 		GasTipCap: uint256.MustFromBig(gasTipCap),
 		GasFeeCap: uint256.MustFromBig(baseFeeFuture),
 		Gas:       uint64(gasLimit),
@@ -691,6 +756,32 @@ func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priv
 	})
 
 	return types.SignTx(rawTx, signer, sender)
+}
+
+func (mt *MEVTest) getFlashbotsTxReceipt(ctx context.Context, tx common.Hash) (mev.TxStatus, error) {
+	// check flashbots status endpoint
+	for range time.NewTicker(time.Second * 2).C {
+		txStatus, err := mt.mevClient.GetTxStatus(ctx, tx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return mev.TxStatus{}, err
+			}
+			slog.Warn("Failed to get tx status", "erorr", err)
+			continue
+		}
+
+		if txStatus.Status == "PENDING" {
+			continue
+		}
+
+		if txStatus.Status == "INCLUDED" || txStatus.Status == "FAILED" {
+			return txStatus, nil
+		}
+
+		return mev.TxStatus{}, errors.New("tx dropped")
+	}
+
+	return mev.TxStatus{}, errors.New("failed to get tx receipt")
 }
 
 func (mt *MEVTest) SendFakeTx(ctx context.Context, sender *ecdsa.PrivateKey, priorityFee *big.Int) (*types.Transaction, error) {
