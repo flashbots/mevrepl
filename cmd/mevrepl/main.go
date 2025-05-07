@@ -239,9 +239,6 @@ func main() {
 					return err
 				}
 
-				// todo: improve stream client impl
-				<-time.After(time.Second * 5)
-
 				go func() {
 					<-listenCtx.Done()
 					<-time.After(time.Second * 1)
