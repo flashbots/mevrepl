@@ -548,7 +548,16 @@ func main() {
 			slog.Info("Computing block_diff duration", "block", currBlock.Number.Uint64(), "curr_block_diff_dur", diff)
 			if diff >= 5 {
 				slog.Warn("Wait till the next block")
-				<-time.After(time.Second * time.Duration(diff))
+				for {
+					nextBlock, err := mevTest.ethClient.HeaderByNumber(ctx, big.NewInt(int64(currBlock.Number.Uint64()+1)))
+					if err != nil {
+						<-time.After(time.Second * 1)
+						continue
+					}
+					currBlock = nextBlock
+					slog.Info("Next block recevied", "next_block", currBlock.Number.Uint64())
+					break
+				}
 			}
 
 			var tx *types.Transaction
@@ -582,7 +591,7 @@ func main() {
 					if err != nil {
 						return err
 					}
-					log.Println("hint:", string(hintRaw))
+					slog.Any("hint:", string(hintRaw))
 
 					bundleResp, err := mevTest.SendTestBackrun(ctx, matchHash, priorityFee, ethAmount, privKey2)
 					if err != nil {
