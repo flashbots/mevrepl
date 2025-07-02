@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"math/big"
 	"os"
@@ -116,7 +118,7 @@ func main() {
 		if publicRPCURL == "" {
 			publicRPCURL = "https://eth.llamarpc.com"
 		}
-		priorityFee = big.NewInt(1e8)
+		priorityFee = big.NewInt(2e9)
 		chainID = big.NewInt(mev.MainnetChainID)
 
 		builderAddr = common.HexToAddress("0xdadB0d80178819F2319190D340ce9A924f783711")
@@ -133,7 +135,7 @@ func main() {
 		panic(fmt.Errorf("failed to init public RPC client error %w", err))
 	}
 
-	mevClient, err := mev.ConstructClient(alice, network, chainID, "fast?hint=full", nil)
+	mevClient, err := mev.ConstructClient(alice, network, chainID, fmt.Sprintf("fast"), nil)
 	if err != nil {
 		panic(fmt.Errorf("failed to construct mev client error %w", err))
 	}
@@ -297,7 +299,7 @@ func main() {
 			VerifyLoop:
 				for {
 					<-time.After(time.Second * 2)
-					onchainTx, pending, err := ethClient.TransactionByHash(ctx, tx.Hash())
+					onchainTx, pending, err := mevTest.mevClient.FlashbotsRPC.TransactionByHash(ctx, tx.Hash())
 					if err != nil {
 						if errors.Is(err, ethereum.NotFound) {
 							continue
@@ -576,6 +578,12 @@ func main() {
 
 			for hint := range ch {
 				if matchHash == hint.Hash {
+					hintRaw, err := json.Marshal(hint)
+					if err != nil {
+						return err
+					}
+					log.Println("hint:", string(hintRaw))
+
 					bundleResp, err := mevTest.SendTestBackrun(ctx, matchHash, priorityFee, ethAmount, privKey2)
 					if err != nil {
 						return fmt.Errorf("failed to send backrun error %w", err)
@@ -679,6 +687,9 @@ func (mt *MEVTest) ethTransfer(ctx context.Context, value *big.Int, priorityFee 
 	} else {
 		gasTipCap = big.NewInt(1e5)
 	}
+	baseFeeFuture.Add(baseFeeFuture, gasTipCap)
+
+	log.Println("baseFee:", baseFeeFuture.String(), "priorityFee:", gasTipCap.String())
 
 	return types.SignTx(types.NewTx(&types.DynamicFeeTx{
 		ChainID:   mt.mevClient.ChainID,
