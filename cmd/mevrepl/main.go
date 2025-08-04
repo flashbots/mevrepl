@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -135,7 +136,7 @@ func main() {
 		panic(fmt.Errorf("failed to init public RPC client error %w", err))
 	}
 
-	mevClient, err := mev.ConstructClient(alice, network, chainID, fmt.Sprintf("fast"), nil)
+	mevClient, err := mev.ConstructClient(alice, network, chainID, fmt.Sprintf("fast?originId=fb-test&allowBob=true"), nil)
 	if err != nil {
 		panic(fmt.Errorf("failed to construct mev client error %w", err))
 	}
@@ -413,7 +414,6 @@ func main() {
 			return nil
 		},
 	}
-
 	// This command is for the test goals. Sends fake tx which must fail
 	sendFakeTxCmd := &cli.Command{
 		Name:        "send-fake-tx",
@@ -426,6 +426,39 @@ func main() {
 				return fmt.Errorf("faield to execute send-private-tx error %w", err)
 			}
 
+			slog.Info("Send fake tx which must fail", "tx_hash", tx.Hash())
+
+			return nil
+		},
+	}
+	sendPrivateRelayTxCmd := &cli.Command{
+		Name:        "send-private-relay-tx",
+		Aliases:     []string{"sprt"},
+		Description: "send private tx to relay",
+		Flags:       txFlags,
+		Action: func(cCtx *cli.Context) error {
+			ethAmountStr := cCtx.String("eth-amount")
+			txTypeStr := TestTxType(cCtx.String("tx-type"))
+			toAddr, err := mevTest.parseToAddr(txTypeStr)
+			if err != nil {
+				return err
+			}
+
+			ethAmount, err := mevTest.getEthValue(ethAmountStr)
+			if err != nil {
+				return err
+			}
+
+			tx, err := mevTest.ethTransfer(ctx, ethAmount, priorityFee, nil, toAddr, nil)
+			if err != nil {
+				return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
+			}
+
+			resp, err := mevTest.SendPrivateRelayTx(ctx, tx)
+			if err != nil {
+				return fmt.Errorf("faield to execute send-private-tx error %w", err)
+			}
+			slog.Info("Resposne:", "resp", resp.String())
 			slog.Info("Send fake tx which must fail", "tx_hash", tx.Hash())
 
 			return nil
@@ -621,7 +654,7 @@ func main() {
 		},
 	}
 
-	app.Commands = append(app.Commands, sendPrivateTxCmd, sendFakeTxCmd, txStatusCmd, hintsStreamCmd, backrunCmd)
+	app.Commands = append(app.Commands, sendPrivateTxCmd, sendFakeTxCmd, txStatusCmd, hintsStreamCmd, backrunCmd, sendPrivateRelayTxCmd)
 
 	if err := app.Run(os.Args); err != nil {
 		panic(err)
@@ -736,7 +769,7 @@ func (mt *MEVTest) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priv
 		nonce = &nonceAt
 	}
 
-	//generate signature for specific contract implementation
+	// generate signature for specific contract implementation
 	auth, err := types.SignSetCode(sender, types.SetCodeAuthorization{
 		ChainID: *uint256.MustFromBig(mt.mevClient.ChainID),
 		Address: mt.batchCallAndSponsorContract,
@@ -864,6 +897,16 @@ func (mt *MEVTest) SendPrivateSimpleTx(ctx context.Context, tx *types.Transactio
 
 	slog.Info("Private tx send", "tx_hash", tx.Hash().String())
 	return tx, nil
+}
+
+func (mt *MEVTest) SendPrivateRelayTx(ctx context.Context, tx *types.Transaction) (hexutil.Bytes, error) {
+	resp, err := mt.mevClient.SendPrivateRelayTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Info("Private tx send", "tx_hash", tx.Hash().String())
+	return resp, nil
 }
 
 func (mt *MEVTest) checkAndSendMultiCallData(addrs []common.Address, payloads [][]byte, results [][]byte) ([]byte, error) {

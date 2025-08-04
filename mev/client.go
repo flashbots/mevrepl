@@ -33,7 +33,7 @@ const (
 
 const (
 	FlashbotsMainnetRPC      = "https://rpc.flashbots.net"
-	FlashbotsMainnetRelay    = "https://relay.flashbots.net"
+	FlashbotsMainnetRelay    = "http://localhost:8080/api"
 	FlashbotsMainnetMEVShare = "https://mev-share.flashbots.net"
 	FlashbotsMainnetProtect  = "https://protect.flashbots.net"
 
@@ -43,9 +43,7 @@ const (
 	FlashbotsSepoliaProtect  = "https://protect-sepolia.flashbots.net"
 )
 
-var (
-	ErrUnsupportedNetwork = errors.New("unsupported network")
-)
+var ErrUnsupportedNetwork = errors.New("unsupported network")
 
 type BundleOpts struct {
 	ValidityBlocks uint64
@@ -133,7 +131,7 @@ func (c *Client) CreateBundle(originalHash common.Hash, block uint64, opts *Bund
 				Hash: &originalHash,
 			},
 		},
-		//Privacy: nil,
+		// Privacy: nil,
 	}
 
 	for _, tx := range backrunTxs {
@@ -169,6 +167,7 @@ func (c *Client) SimulateBundle(ctx context.Context, bundle *rpctypes.MevSendBun
 
 	return &bundleSimResp, nil
 }
+
 func (c *Client) CancelBundle(ctx context.Context, hash common.Hash) error {
 	err := c.FlashbotsRelay.CallFor(ctx, &hash, "mev_cancelBundleByHash")
 	if err != nil {
@@ -180,6 +179,18 @@ func (c *Client) CancelBundle(ctx context.Context, hash common.Hash) error {
 
 func (c *Client) SendPrivateTx(ctx context.Context, tx *types.Transaction) error {
 	return c.FlashbotsRPC.SendTransaction(ctx, tx)
+}
+
+func (c *Client) SendPrivateRelayTx(ctx context.Context, tx *types.Transaction) (hexutil.Bytes, error) {
+	var resp hexutil.Bytes
+
+	bts, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	rtx := (*hexutil.Bytes)(&bts)
+	err = c.FlashbotsRelay.CallFor(ctx, &resp, "eth_sendPrivateRawTransaction", rtx)
+	return resp, err
 }
 
 func (c *Client) GetTxStatus(ctx context.Context, txHash common.Hash) (TxStatus, error) {
