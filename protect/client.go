@@ -65,8 +65,11 @@ type Client struct {
 }
 
 type ClientOpts struct {
-	RPCOpts    string
-	HTTPClient *http.Client
+	RPCOpts          string
+	HTTPClient       *http.Client
+	FlashbotsRPC     string
+	FlashbotsRelay   string
+	FlashbotsProtect string
 }
 
 func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientOpts) (*Client, error) {
@@ -99,6 +102,18 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 		chainID = big.NewInt(SepoliaChainID)
 	default:
 		return nil, ErrUnsupportedNetwork
+	}
+
+	if opts.FlashbotsProtect != "" {
+		flashbotsProtectURL = opts.FlashbotsProtect
+	}
+
+	if opts.FlashbotsRPC != "" {
+		flashbotsRPCURL = opts.FlashbotsRPC
+	}
+
+	if opts.FlashbotsRelay != "" {
+		flashbotsRelayURL = opts.FlashbotsRelay
 	}
 
 	if opts.HTTPClient == nil {

@@ -60,6 +60,11 @@ func main() {
 		panic(fmt.Errorf("failed to parse secp256k1 private key error %w", err))
 	}
 
+	// optionally available to rewrite main urls to interact with flashbots APIs
+	flashbotsRPCURL := os.Getenv("FLASHBOTS_RPC_URL")
+	flashbotsRelayURL := os.Getenv("FLASHBOTS_RELAY_URL")
+	flashbotsProtectURL := os.Getenv("FLASHBOTS_PROTECT_URL")
+
 	var (
 		priorityFee *big.Int
 
@@ -110,6 +115,10 @@ func main() {
 	internalTestingRPCOpts := "fast?originId=fb-test"
 	mevClient, err := protect.ConstructClient(alice, network, &protect.ClientOpts{
 		RPCOpts: internalTestingRPCOpts,
+
+		FlashbotsRPC:     flashbotsRPCURL,
+		FlashbotsRelay:   flashbotsRelayURL,
+		FlashbotsProtect: flashbotsProtectURL,
 	})
 	if err != nil {
 		panic(fmt.Errorf("failed to construct mev client error %w", err))
