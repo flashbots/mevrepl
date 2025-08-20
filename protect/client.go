@@ -1,4 +1,4 @@
-package mev
+package protect
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 
@@ -43,9 +44,7 @@ const (
 	FlashbotsSepoliaProtect  = "https://protect-sepolia.flashbots.net"
 )
 
-var (
-	ErrUnsupportedNetwork = errors.New("unsupported network")
-)
+var ErrUnsupportedNetwork = errors.New("unsupported network")
 
 type BundleOpts struct {
 	ValidityBlocks uint64
@@ -65,12 +64,28 @@ type Client struct {
 	httpClient *http.Client
 }
 
-func ConstructClient(privateKey *ecdsa.PrivateKey, network string, chainID *big.Int, sendTxOpts string, httpClient *http.Client) (*Client, error) {
+type ClientOpts struct {
+	RPCOpts          string
+	HTTPClient       *http.Client
+	FlashbotsRPC     string
+	FlashbotsRelay   string
+	FlashbotsProtect string
+}
+
+func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientOpts) (*Client, error) {
+	if opts == nil {
+		opts = &ClientOpts{
+			RPCOpts:    "fast",
+			HTTPClient: http.DefaultClient,
+		}
+	}
 	var (
 		flashbotsRPCURL      string
 		flashbotsRelayURL    string
 		flashbotsMEVShareURL string
 		flashbotsProtectURL  string
+
+		chainID *big.Int
 	)
 	switch network {
 	case Mainnet:
@@ -78,20 +93,34 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, chainID *big.
 		flashbotsRelayURL = FlashbotsMainnetRelay
 		flashbotsMEVShareURL = FlashbotsMainnetMEVShare
 		flashbotsProtectURL = FlashbotsMainnetProtect
+		chainID = big.NewInt(MainnetChainID)
 	case SepoliaNetwork:
 		flashbotsRPCURL = FlashbotsSepoliaRPC
 		flashbotsRelayURL = FlashbotsSepoliaRelay
 		flashbotsMEVShareURL = FlashbotsSepoliaMEVShare
 		flashbotsProtectURL = FlashbotsSepoliaProtect
+		chainID = big.NewInt(SepoliaChainID)
 	default:
 		return nil, ErrUnsupportedNetwork
 	}
 
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+	if opts.FlashbotsProtect != "" {
+		flashbotsProtectURL = opts.FlashbotsProtect
 	}
 
-	flashbotsRPCClient, err := ethclient.Dial(flashbotsRPCURL + "/" + sendTxOpts)
+	if opts.FlashbotsRPC != "" {
+		flashbotsRPCURL = opts.FlashbotsRPC
+	}
+
+	if opts.FlashbotsRelay != "" {
+		flashbotsRelayURL = opts.FlashbotsRelay
+	}
+
+	if opts.HTTPClient == nil {
+		opts.HTTPClient = http.DefaultClient
+	}
+
+	flashbotsRPCClient, err := ethclient.Dial(flashbotsRPCURL + "/" + opts.RPCOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -106,11 +135,11 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, chainID *big.
 		key:                  privateKey,
 		FlashbotsMEVShareURL: flashbotsMEVShareURL,
 		FlashbotsProtectURL:  flashbotsProtectURL,
-		httpClient:           httpClient,
+		httpClient:           opts.HTTPClient,
 	}, nil
 }
 
-func (c *Client) CreateBundle(originalHash common.Hash, block uint64, opts *BundleOpts, backrunTxs ...*types.Transaction) (*rpctypes.MevSendBundleArgs, error) {
+func (c *Client) CreateMEVBundle(originalHash common.Hash, block uint64, opts *BundleOpts, backrunTxs ...*types.Transaction) (*rpctypes.MevSendBundleArgs, error) {
 	if len(backrunTxs) == 0 {
 		return nil, nil
 	}
@@ -121,8 +150,8 @@ func (c *Client) CreateBundle(originalHash common.Hash, block uint64, opts *Bund
 
 	// todo: think about this part
 	inclusion := rpctypes.MevBundleInclusion{
-		BlockNumber: hexutil.Uint64(block + 1),
-		MaxBlock:    hexutil.Uint64(block + opts.ValidityBlocks),
+		BlockNumber: hexutil.Uint64(block - 1),
+		MaxBlock:    hexutil.Uint64(block - 1),
 	}
 
 	bundle := &rpctypes.MevSendBundleArgs{
@@ -133,7 +162,7 @@ func (c *Client) CreateBundle(originalHash common.Hash, block uint64, opts *Bund
 				Hash: &originalHash,
 			},
 		},
-		//Privacy: nil,
+		// Privacy: nil,
 	}
 
 	for _, tx := range backrunTxs {
@@ -150,7 +179,7 @@ func (c *Client) CreateBundle(originalHash common.Hash, block uint64, opts *Bund
 	return bundle, nil
 }
 
-func (c *Client) SendBundle(ctx context.Context, bundle *rpctypes.MevSendBundleArgs) (*SendMevBundleResponse, error) {
+func (c *Client) SendMEVBundle(ctx context.Context, bundle *rpctypes.MevSendBundleArgs) (*SendMevBundleResponse, error) {
 	var bundleResp SendMevBundleResponse
 	err := c.FlashbotsRelay.CallFor(ctx, &bundleResp, "mev_sendBundle", bundle)
 	if err != nil {
@@ -160,7 +189,18 @@ func (c *Client) SendBundle(ctx context.Context, bundle *rpctypes.MevSendBundleA
 	return &bundleResp, nil
 }
 
-func (c *Client) SimulateBundle(ctx context.Context, bundle *rpctypes.MevSendBundleArgs) (*SimulateBundleResponse, error) {
+func (c *Client) SendEthBundle(ctx context.Context, bundle *SendBundleArgs) (*SendMevBundleResponse, error) {
+	var bundleResp SendMevBundleResponse
+	err := c.FlashbotsRelay.CallFor(ctx, &bundleResp, "eth_sendBundle", bundle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call mev_sendBundle error %w", err)
+	}
+
+	return &bundleResp, nil
+
+}
+
+func (c *Client) SimulateMEVBundle(ctx context.Context, bundle *rpctypes.MevSendBundleArgs) (*SimulateBundleResponse, error) {
 	var bundleSimResp SimulateBundleResponse
 	err := c.FlashbotsRelay.CallFor(ctx, &bundleSimResp, "mev_simBundle", bundle)
 	if err != nil {
@@ -169,7 +209,8 @@ func (c *Client) SimulateBundle(ctx context.Context, bundle *rpctypes.MevSendBun
 
 	return &bundleSimResp, nil
 }
-func (c *Client) CancelBundle(ctx context.Context, hash common.Hash) error {
+
+func (c *Client) CancelMEVBundle(ctx context.Context, hash common.Hash) error {
 	err := c.FlashbotsRelay.CallFor(ctx, &hash, "mev_cancelBundleByHash")
 	if err != nil {
 		return fmt.Errorf("failed to call mev_cancelBundleByHash error %w", err)
@@ -180,6 +221,97 @@ func (c *Client) CancelBundle(ctx context.Context, hash common.Hash) error {
 
 func (c *Client) SendPrivateTx(ctx context.Context, tx *types.Transaction) error {
 	return c.FlashbotsRPC.SendTransaction(ctx, tx)
+}
+
+func (c *Client) CancelEthBundle(ctx context.Context, cancelArgs CancelETHBundleArgs) error {
+	resp, err := c.FlashbotsRelay.Call(ctx, "eth_cancelBundle", cancelArgs)
+	if err != nil {
+		return fmt.Errorf("failed to call eth_cancelBundle %w", err)
+	}
+
+	slog.Info("Cancel eth bundle response", "response", resp.Result)
+	if resp.Error != nil {
+		err = errors.New(resp.Error.Message)
+	}
+
+	return err
+
+}
+
+func (c *Client) SendPrivateRawRelayTx(ctx context.Context, tx *types.Transaction, builders ...string) (hexutil.Bytes, error) {
+	var resp hexutil.Bytes
+
+	bts, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	rtx := (*hexutil.Bytes)(&bts)
+	prefs := PrivateTxPreferences{
+		Privacy: TxPrivacyPreferences{
+			Builders: builders,
+		},
+	}
+	err = c.FlashbotsRelay.CallFor(ctx, &resp, "eth_sendPrivateRawTransaction", rtx, &prefs)
+	return resp, err
+}
+
+func (c *Client) SendPrivateRelayTx(ctx context.Context, tx *types.Transaction) (hexutil.Bytes, error) {
+	var resp hexutil.Bytes
+
+	bts, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	rtx := (*hexutil.Bytes)(&bts)
+
+	args := SendPrivateTxArgs{
+		Tx: rtx.String(),
+	}
+
+	err = c.FlashbotsRelay.CallFor(ctx, &resp, "eth_sendPrivateTransaction", args)
+	return resp, err
+
+}
+
+func (c *Client) SetFeeRefundRecipient(ctx context.Context, signer common.Address, deligateAddr common.Address) error {
+	res, err := c.FlashbotsRelay.Call(ctx, "flashbots_setFeeRefundRecipient", signer, deligateAddr)
+	if err != nil {
+		return err
+	}
+
+	slog.Info("Set fee refund recipient response", "response", res.Result)
+	return nil
+}
+
+func (c *Client) CallEthBundle(ctx context.Context, args *CallBundleArgs) error {
+	resp, err := c.FlashbotsRelay.Call(ctx, "eth_callBundle", args)
+	if err != nil {
+		return fmt.Errorf("failed to call eth_callBundle %w", err)
+	}
+
+	if resp.Error != nil {
+		slog.Error("ETH call bundle", "err", resp.Error.Message)
+	} else {
+		slog.Info("ETH call bundle", "simRes", resp.Result)
+	}
+
+	return nil
+}
+
+func (c *Client) CancelPrivateRelayTx(ctx context.Context, txHash common.Hash) error {
+	resp, err := c.FlashbotsRelay.Call(ctx, "eth_cancelPrivateTransaction", CancelPrivateTxArgs{TxHash: txHash})
+	if err != nil {
+		return fmt.Errorf("failed to call eth_cancelPrivateTransaction %w", err)
+	}
+
+	if resp.Error != nil {
+		slog.Error("ETH cancel private transaction", "err", resp.Error.Message)
+	} else {
+
+		slog.Info("ETH cancel private transaction", "res", resp.Result)
+	}
+
+	return nil
 }
 
 func (c *Client) GetTxStatus(ctx context.Context, txHash common.Hash) (TxStatus, error) {

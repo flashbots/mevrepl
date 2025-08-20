@@ -1,6 +1,8 @@
-package mev
+package protect
 
 import (
+	"encoding/json"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -8,6 +10,7 @@ import (
 
 type SendMevBundleResponse struct {
 	BundleHash common.Hash `json:"bundleHash"`
+	Smart      bool        `json:"smart,omitempty"`
 }
 
 type SimulateBundleResponse struct {
@@ -68,4 +71,51 @@ type TxStatus struct {
 	FastMode       bool        `json:"fastMode"`
 	IsRevert       bool        `json:"isRevert"`
 	SeenInMempool  bool        `json:"seenInMempool"`
+}
+
+type CallBundleArgs struct {
+	Txs              []string `json:"txs"`              // Array[String], A list of signed transactions to execute in an atomic bundle
+	BlockNumber      string   `json:"blockNumber"`      // String, a hex encoded block number for which this bundle is valid on
+	StateBlockNumber string   `json:"stateBlockNumber"` // String, either a hex encoded number or a block tag for which state to base this simulation on. Can use "latest"
+	Timestamp        *uint64  `json:"timestamp"`        // (Optional) Number, the timestamp to use for this bundle simulation, in seconds since the unix epoch
+}
+
+type SendPrivateTxArgs struct {
+	Tx             string          `json:"tx"`             // String, raw signed transaction
+	MaxBlockNumber json.RawMessage `json:"maxBlockNumber"` // Hex-encoded number string, optional. Highest block number in which the transaction should be included. For backwards compatibility can be an int.
+	// Preferences    PrivateTxPreferences `json:"preferences"`
+}
+
+type SendBundleArgs struct {
+	Txs               []string      // Array[String], A list of signed transactions to execute in an atomic bundle
+	BlockNumber       string        // String, a hex encoded block number for which this bundle is valid on
+	ReplacementUuid   string        // (Optional) uuid-formatted String, used to replace previous bundles
+	MinTimestamp      *uint64       // (Optional) Number, the minimum timestamp for which this bundle is valid, in seconds since the unix epoch
+	MaxTimestamp      *uint64       // (Optional) Number, the maximum timestamp for which this bundle is valid, in seconds since the unix epoch
+	RevertingTxHashes []common.Hash // (Optional) Array[String], A list of tx hashes that are allowed to revert
+	Builders          []string
+}
+
+type TxPrivacyPreferences struct {
+	Builders       []string `json:"builders,omitempty"`
+	AllowBob       bool     `json:"allowBob,omitempty"`
+	MempoolRPC     string   `json:"mempoolRpc"`
+	AuctionTimeout uint64   `json:"auctionTimeout,omitempty"`
+}
+
+type PrivateTxPreferences struct {
+	Privacy TxPrivacyPreferences `json:"privacy"`
+	// Validity   TxValidityPreferences `json:"validity"`
+	Fast       bool `json:"fast"` // NOTE: it does nothing when set directly, it is only used for reporting by rpc-endpoint
+	CanRevert  bool `json:"canRevert"`
+	BlockRange int  `json:"blockRange"`
+}
+
+type CancelPrivateTxArgs struct {
+	TxHash common.Hash // String, transaction hash of private tx to be cancelled
+}
+
+type CancelETHBundleArgs struct {
+	ReplacementUuid string // uuid-formatted String, all bundles provided with that uuid will be cancelled
+	Builders        []string
 }
