@@ -148,10 +148,9 @@ func (c *Client) CreateMEVBundle(originalHash common.Hash, block uint64, opts *B
 		opts = &BundleOpts{ValidityBlocks: defaultValidityBlocks}
 	}
 
-	// todo: think about this part
 	inclusion := rpctypes.MevBundleInclusion{
-		BlockNumber: hexutil.Uint64(block - 1),
-		MaxBlock:    hexutil.Uint64(block - 1),
+		BlockNumber: hexutil.Uint64(block + 1),
+		MaxBlock:    hexutil.Uint64(opts.ValidityBlocks),
 	}
 
 	bundle := &rpctypes.MevSendBundleArgs{
