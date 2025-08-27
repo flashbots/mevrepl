@@ -110,6 +110,7 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 
 	if opts.FlashbotsRPC != "" {
 		flashbotsRPCURL = opts.FlashbotsRPC
+		opts.RPCOpts = ""
 	}
 
 	if opts.FlashbotsRelay != "" {
@@ -120,7 +121,11 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 		opts.HTTPClient = http.DefaultClient
 	}
 
-	flashbotsRPCClient, err := ethclient.Dial(flashbotsRPCURL + "/" + opts.RPCOpts)
+	url := flashbotsRPCURL
+	if opts.RPCOpts != "" {
+		url = flashbotsRPCURL + "/" + opts.RPCOpts
+	}
+	flashbotsRPCClient, err := ethclient.Dial(url)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +201,6 @@ func (c *Client) SendEthBundle(ctx context.Context, bundle *SendBundleArgs) (*Se
 	}
 
 	return &bundleResp, nil
-
 }
 
 func (c *Client) SimulateMEVBundle(ctx context.Context, bundle *rpctypes.MevSendBundleArgs) (*SimulateBundleResponse, error) {
@@ -234,7 +238,6 @@ func (c *Client) CancelEthBundle(ctx context.Context, cancelArgs CancelETHBundle
 	}
 
 	return err
-
 }
 
 func (c *Client) SendPrivateRawRelayTx(ctx context.Context, tx *types.Transaction, builders ...string) (hexutil.Bytes, error) {
@@ -269,7 +272,6 @@ func (c *Client) SendPrivateRelayTx(ctx context.Context, tx *types.Transaction) 
 
 	err = c.FlashbotsRelay.CallFor(ctx, &resp, "eth_sendPrivateTransaction", args)
 	return resp, err
-
 }
 
 func (c *Client) SetFeeRefundRecipient(ctx context.Context, signer common.Address, deligateAddr common.Address) error {
@@ -306,7 +308,6 @@ func (c *Client) CancelPrivateRelayTx(ctx context.Context, txHash common.Hash) e
 	if resp.Error != nil {
 		slog.Error("ETH cancel private transaction", "err", resp.Error.Message)
 	} else {
-
 		slog.Info("ETH cancel private transaction", "res", resp.Result)
 	}
 
