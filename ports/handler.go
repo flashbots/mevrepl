@@ -301,6 +301,62 @@ func (h *Handler) CancelRelayTx(ctx context.Context) func(*cli.Context) error {
 	}
 }
 
+func (h *Handler) CancelRpcTx(ctx context.Context) func(*cli.Context) error {
+	return func(cCtx *cli.Context) error {
+		ethAmountStr := cCtx.String("eth-amount")
+		txTypeStr := TestTxType(cCtx.String("tx-type"))
+		toAddr, err := h.parseToAddr(txTypeStr)
+		if err != nil {
+			return err
+		}
+
+		ethAmount, err := h.getEthValue(ethAmountStr)
+		if err != nil {
+			return err
+		}
+
+		senderAddr := crypto.PubkeyToAddress(h.Alice.PublicKey)
+		nonce, err := h.MEVClient.FlashbotsRPC.PendingNonceAt(ctx, senderAddr)
+		if err != nil {
+			return fmt.Errorf("failed to get pending nonce: %w", err)
+		}
+
+		tx, err := h.ethTransfer(ctx, ethAmount, h.DefaultPriorityFee, nil, toAddr, &nonce)
+		if err != nil {
+			return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
+		}
+
+		_, err = h.sendPrivateTx(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("failed to send private tx error %w", err)
+		}
+
+		slog.Info("Sent private transaction before cancellation", "hash", tx.Hash(), "nonce", nonce)
+
+		// protect-rpc detects self-transfer (to == sender && data <= 2 bytes) and cancels original tx with same nonce
+		cancelTx, err := h.ethTransfer(ctx, big.NewInt(1), h.DefaultPriorityFee, nil, senderAddr, &nonce)
+		if err != nil {
+			return fmt.Errorf("failed to construct cancellation tx error %w", err)
+		}
+
+		_, err = h.sendPrivateTx(ctx, cancelTx)
+		if err != nil {
+			return fmt.Errorf("failed to send cancellation tx error %w", err)
+		}
+
+		slog.Info("Sent cancellation transaction (self-transfer)", "hash", cancelTx.Hash(), "nonce", nonce)
+
+		txStatus, err := h.getFlashbotsTxReceipt(ctx, tx.Hash())
+		if err != nil {
+			slog.Warn("Failed to get tx status", "error", err)
+		} else {
+			slog.Info("Final tx status", "originalTx", tx.Hash(), "status", txStatus.Status)
+		}
+
+		return nil
+	}
+}
+
 func (h *Handler) sendPrivateRawRelayTx(ctx context.Context, tx *types.Transaction, builders ...string) (*types.Transaction, error) {
 	resp, err := h.MEVClient.SendPrivateRawRelayTx(ctx, tx, builders...)
 	if err != nil {
