@@ -211,6 +211,14 @@ func main() {
 		Action:      handler.CancelRelayTx(ctx),
 	}
 
+	cancelRpcTxCmd := &cli.Command{
+		Name:        "cancel-rpc-tx",
+		Aliases:     []string{"crpc"},
+		Description: "cancel private tx via RPC using self-transfer detection",
+		Flags:       txFlags,
+		Action:      handler.CancelRpcTx(ctx),
+	}
+
 	// This command calls Flashbots Protect Transaction Status API and logs info txStatus
 	//
 	// For details, see: https://docs.flashbots.net/flashbots-protect/additional-documentation/status-api
@@ -260,7 +268,7 @@ func main() {
 		Action:      handler.Backrun(ctx),
 	}
 
-	app.Commands = append(app.Commands, sendPrivateTxCmd, sendFakeTxCmd, txStatusCmd, hintsStreamCmd, backrunCmd, sendPrivateRelayTxCmd, ethCallBundleCmd, ethSendBundleCmd, cancelRelayTxCmd, ethCancelBundleCmd)
+	app.Commands = append(app.Commands, sendPrivateTxCmd, sendFakeTxCmd, txStatusCmd, hintsStreamCmd, backrunCmd, sendPrivateRelayTxCmd, ethCallBundleCmd, ethSendBundleCmd, cancelRelayTxCmd, cancelRpcTxCmd, ethCancelBundleCmd)
 
 	if err := app.Run(os.Args); err != nil {
 		panic(err)
