@@ -81,9 +81,9 @@ type CallBundleArgs struct {
 }
 
 type SendPrivateTxArgs struct {
-	Tx             string          `json:"tx"`             // String, raw signed transaction
-	MaxBlockNumber json.RawMessage `json:"maxBlockNumber"` // Hex-encoded number string, optional. Highest block number in which the transaction should be included. For backwards compatibility can be an int.
-	// Preferences    PrivateTxPreferences `json:"preferences"`
+	Tx             string               `json:"tx"`             // String, raw signed transaction
+	MaxBlockNumber json.RawMessage      `json:"maxBlockNumber"` // Hex-encoded number string, optional. Highest block number in which the transaction should be included. For backwards compatibility can be an int.
+	Preferences    PrivateTxPreferences `json:"preferences"`
 }
 
 type SendBundleArgs struct {
@@ -103,12 +103,21 @@ type TxPrivacyPreferences struct {
 	AuctionTimeout uint64   `json:"auctionTimeout,omitempty"`
 }
 
+type RefundConfig struct {
+	Address common.Address `json:"address"`
+	Percent int            `json:"percent"`
+}
+
+type TxValidityPreferences struct {
+	Refund []RefundConfig `json:"refund,omitempty"`
+}
+
 type PrivateTxPreferences struct {
-	Privacy TxPrivacyPreferences `json:"privacy"`
-	// Validity   TxValidityPreferences `json:"validity"`
-	Fast       bool `json:"fast"` // NOTE: it does nothing when set directly, it is only used for reporting by rpc-endpoint
-	CanRevert  bool `json:"canRevert"`
-	BlockRange int  `json:"blockRange"`
+	Privacy    TxPrivacyPreferences  `json:"privacy"`
+	Validity   TxValidityPreferences `json:"validity"`
+	Fast       bool                  `json:"fast"` // NOTE: it does nothing when set directly, it is only used for reporting by rpc-endpoint
+	CanRevert  bool                  `json:"canRevert"`
+	BlockRange int                   `json:"blockRange"`
 }
 
 type CancelPrivateTxArgs struct {
@@ -118,4 +127,29 @@ type CancelPrivateTxArgs struct {
 type CancelETHBundleArgs struct {
 	ReplacementUuid string // uuid-formatted String, all bundles provided with that uuid will be cancelled
 	Builders        []string
+}
+
+// eth_simulateV1 types
+
+type SimulateV1Call struct {
+	From                 *common.Address `json:"from,omitempty"`
+	To                   *common.Address `json:"to,omitempty"`
+	Gas                  *hexutil.Uint64 `json:"gas,omitempty"`
+	MaxFeePerGas         *hexutil.Big    `json:"maxFeePerGas,omitempty"`
+	MaxPriorityFeePerGas *hexutil.Big    `json:"maxPriorityFeePerGas,omitempty"`
+	Value                *hexutil.Big    `json:"value,omitempty"`
+	Nonce                *hexutil.Uint64 `json:"nonce,omitempty"`
+	Input                *hexutil.Bytes  `json:"input,omitempty"`
+}
+
+type SimulateV1BlockStateCall struct {
+	BlockOverrides map[string]interface{} `json:"blockOverrides,omitempty"`
+	StateOverrides map[string]interface{} `json:"stateOverrides,omitempty"`
+	Calls          []SimulateV1Call       `json:"calls"`
+}
+
+type SimulateV1Args struct {
+	BlockStateCalls []SimulateV1BlockStateCall `json:"blockStateCalls"`
+	TraceTransfers  bool                       `json:"traceTransfers"`
+	Validation      bool                       `json:"validation"`
 }

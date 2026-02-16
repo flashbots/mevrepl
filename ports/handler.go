@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"math/big"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/flashbots/go-utils/rpctypes"
 	"github.com/flashbots/mevrepl/mevutil"
 	"github.com/flashbots/mevrepl/protect"
 	"github.com/holiman/uint256"
@@ -60,6 +60,32 @@ type Handler struct {
 	DefaultPriorityFee          *big.Int
 }
 
+const defaultPriorityFee = 1e5 // 100,000 wei
+
+type txFeeParams struct {
+	gasFeeCap *big.Int
+	gasTipCap *big.Int
+}
+
+// calcTxFees computes EIP-1559 fee parameters from current base fee.
+// multiplierPct is the base fee multiplier percentage (e.g. 110 for 110%, 150 for 150%).
+// If priorityFee is nil, defaults to 100,000 wei.
+func calcTxFees(baseFee *big.Int, multiplierPct int64, priorityFee *big.Int) txFeeParams {
+	gasTipCap := priorityFee
+	if gasTipCap == nil {
+		gasTipCap = big.NewInt(defaultPriorityFee)
+	}
+
+	gasFeeCap := new(big.Int).Mul(baseFee, big.NewInt(multiplierPct))
+	gasFeeCap.Div(gasFeeCap, big.NewInt(100))
+	gasFeeCap.Add(gasFeeCap, gasTipCap)
+
+	return txFeeParams{
+		gasFeeCap: gasFeeCap,
+		gasTipCap: gasTipCap,
+	}
+}
+
 func (h *Handler) SendPrivateTx(ctx context.Context) func(*cli.Context) error {
 	return func(cCtx *cli.Context) error {
 		ethAmountStr := cCtx.String("eth-amount")
@@ -89,7 +115,7 @@ func (h *Handler) SendPrivateTx(ctx context.Context) func(*cli.Context) error {
 
 		_, err = h.sendPrivateTx(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("faield to execute send-private-tx error %w", err)
+			return fmt.Errorf("failed to execute send-private-tx error %w", err)
 		}
 
 		txStatus, err := h.getFlashbotsTxReceipt(ctx, tx.Hash())
@@ -162,7 +188,7 @@ func (h *Handler) Backrun(ctx context.Context) func(*cli.Context) error {
 					continue
 				}
 				currBlock = nextBlock
-				slog.Info("Next block recevied", "next_block", currBlock.Number.Uint64())
+				slog.Info("Next block received", "next_block", currBlock.Number.Uint64())
 				break
 			}
 		}
@@ -183,7 +209,7 @@ func (h *Handler) Backrun(ctx context.Context) func(*cli.Context) error {
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("faield to send tx error %w", err)
+			return fmt.Errorf("failed to send tx error %w", err)
 		}
 
 		privKey2, err := crypto.HexToECDSA(rawKeyY)
@@ -196,13 +222,15 @@ func (h *Handler) Backrun(ctx context.Context) func(*cli.Context) error {
 			return err
 		}
 
+		time.Sleep(time.Second * 2)
+
 		for hint := range ch {
 			if matchHash == hint.Hash {
 				hintRaw, err := json.Marshal(hint)
 				if err != nil {
 					return err
 				}
-				slog.Any("hint:", string(hintRaw))
+				slog.Info("Hint data", "obj", string(hintRaw))
 
 				bundleResp, err := h.SendBackrun(ctx, matchHash, h.DefaultPriorityFee, ethAmount, privKey2)
 				if err != nil {
@@ -214,7 +242,7 @@ func (h *Handler) Backrun(ctx context.Context) func(*cli.Context) error {
 				for range time.NewTicker(time.Second * 2).C {
 					txStatus, err := h.MEVClient.GetTxStatus(ctx, tx.Hash())
 					if err != nil {
-						slog.Warn("Failed to get tx status", "erorr", err)
+						slog.Warn("Failed to get tx status", "error", err)
 						continue
 					}
 
@@ -229,7 +257,6 @@ func (h *Handler) Backrun(ctx context.Context) func(*cli.Context) error {
 		}
 
 		return ErrHintNotFound
-
 	}
 }
 
@@ -287,7 +314,7 @@ func (h *Handler) CancelRelayTx(ctx context.Context) func(*cli.Context) error {
 
 		_, err = h.sendPrivateRawRelayTx(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("faield to execute eth-call-bundle error %w", err)
+			return fmt.Errorf("failed to execute eth-call-bundle error %w", err)
 		}
 
 		slog.Info("Sent private transaction before cancelation", "hash", tx.Hash())
@@ -409,7 +436,7 @@ func (h *Handler) CancelEthBundle(ctx context.Context) func(*cli.Context) error 
 
 		err = h.sendEthBundle(ctx, args[0])
 		if err != nil {
-			return fmt.Errorf("faield to execute eth-call-bundle error %w", err)
+			return fmt.Errorf("failed to execute eth-call-bundle error %w", err)
 		}
 
 		err = h.MEVClient.CancelEthBundle(ctx, protect.CancelETHBundleArgs{ReplacementUuid: replacementID})
@@ -423,32 +450,14 @@ func (h *Handler) CancelEthBundle(ctx context.Context) func(*cli.Context) error 
 
 func (h *Handler) SendEthBundle(ctx context.Context) func(*cli.Context) error {
 	return func(cCtx *cli.Context) error {
-
-		ethAmountStr := cCtx.String("eth-amount")
-		txTypeStr := TestTxType(cCtx.String("tx-type"))
-		toAddr, err := h.parseToAddr(txTypeStr)
-		if err != nil {
-			return err
-		}
-
 		currBlock, err := h.EthClient.HeaderByNumber(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		ethAmount, err := h.getEthValue(ethAmountStr)
+		rawTx, err := h.resolveRawTx(ctx, cCtx)
 		if err != nil {
 			return err
-		}
-
-		tx, err := h.ethTransfer(ctx, ethAmount, h.DefaultPriorityFee, nil, toAddr, nil)
-		if err != nil {
-			return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
-		}
-
-		rawTx, err := tx.MarshalBinary()
-		if err != nil {
-			return fmt.Errorf("failed to marshal tx %w", err)
 		}
 
 		bn := new(big.Int).Add(currBlock.Number, big.NewInt(1))
@@ -463,8 +472,46 @@ func (h *Handler) SendEthBundle(ctx context.Context) func(*cli.Context) error {
 
 		err = h.sendEthBundle(ctx, args[0])
 		if err != nil {
-			return fmt.Errorf("faield to execute eth-call-bundle error %w", err)
+			return fmt.Errorf("failed to execute eth-call-bundle error %w", err)
 		}
+
+		return nil
+	}
+}
+
+func (h *Handler) SendMEVBundle(ctx context.Context) func(*cli.Context) error {
+	return func(cCtx *cli.Context) error {
+		currBlock, err := h.EthClient.HeaderByNumber(ctx, nil)
+		if err != nil {
+			return err
+		}
+
+		rawTx, err := h.resolveRawTx(ctx, cCtx)
+		if err != nil {
+			return err
+		}
+
+		inclusion := rpctypes.MevBundleInclusion{
+			BlockNumber: hexutil.Uint64(currBlock.Number.Uint64() + 1),
+			MaxBlock:    hexutil.Uint64(currBlock.Number.Uint64() + 2),
+		}
+
+		bundle := &rpctypes.MevSendBundleArgs{
+			Version:   protect.DefaultAPIVersion,
+			Inclusion: inclusion,
+		}
+
+		bundle.Body = append(bundle.Body, rpctypes.MevBundleBody{
+			Tx:         (*hexutil.Bytes)(&rawTx),
+			RevertMode: rpctypes.RevertModeAllow,
+		})
+
+		resp, err := h.MEVClient.SendMEVBundle(ctx, bundle)
+		if err != nil {
+			return err
+		}
+
+		slog.Info("Send MEV bundle", "bundleHash", resp.BundleHash)
 
 		return nil
 	}
@@ -484,31 +531,14 @@ func (h *Handler) sendEthBundle(ctx context.Context, args *protect.SendBundleArg
 
 func (h *Handler) CallEthBundle(ctx context.Context) func(*cli.Context) error {
 	return func(cCtx *cli.Context) error {
-		ethAmountStr := cCtx.String("eth-amount")
-		txTypeStr := TestTxType(cCtx.String("tx-type"))
-		toAddr, err := h.parseToAddr(txTypeStr)
-		if err != nil {
-			return err
-		}
-
 		currBlock, err := h.EthClient.HeaderByNumber(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		ethAmount, err := h.getEthValue(ethAmountStr)
+		rawTx, err := h.resolveRawTx(ctx, cCtx)
 		if err != nil {
 			return err
-		}
-
-		tx, err := h.ethTransfer(ctx, ethAmount, h.DefaultPriorityFee, nil, toAddr, nil)
-		if err != nil {
-			return fmt.Errorf("failed to construct ethTransfer tx error %w", err)
-		}
-
-		rawTx, err := tx.MarshalBinary()
-		if err != nil {
-			return fmt.Errorf("failed to marshal tx %w", err)
 		}
 
 		args := &protect.CallBundleArgs{
@@ -519,6 +549,86 @@ func (h *Handler) CallEthBundle(ctx context.Context) func(*cli.Context) error {
 		}
 
 		return h.MEVClient.CallEthBundle(ctx, args)
+	}
+}
+
+func txToSimulateV1Call(tx *types.Transaction) (protect.SimulateV1Call, error) {
+	sender, err := TxSender(tx)
+	if err != nil {
+		return protect.SimulateV1Call{}, err
+	}
+
+	gas := hexutil.Uint64(tx.Gas())
+	nonce := hexutil.Uint64(tx.Nonce())
+	value := (*hexutil.Big)(tx.Value())
+	to := tx.To()
+	data := hexutil.Bytes(tx.Data())
+
+	call := protect.SimulateV1Call{
+		From:  &sender,
+		To:    to,
+		Gas:   &gas,
+		Value: value,
+		Nonce: &nonce,
+		Input: &data,
+	}
+
+	if tx.Type() == types.DynamicFeeTxType || tx.Type() == types.AccessListTxType {
+		call.MaxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
+		call.MaxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
+	}
+
+	return call, nil
+}
+
+func (h *Handler) SimulateV1(ctx context.Context) func(*cli.Context) error {
+	return func(cCtx *cli.Context) error {
+		rawTxs, err := h.resolveRawTxs(ctx, cCtx)
+		if err != nil {
+			return err
+		}
+
+		var calls []protect.SimulateV1Call
+		for _, rawTxBytes := range rawTxs {
+			var tx types.Transaction
+			if err := tx.UnmarshalBinary(rawTxBytes); err != nil {
+				return fmt.Errorf("failed to unmarshal transaction: %w", err)
+			}
+
+			call, err := txToSimulateV1Call(&tx)
+			if err != nil {
+				return err
+			}
+			calls = append(calls, call)
+		}
+
+		args := &protect.SimulateV1Args{
+			BlockStateCalls: []protect.SimulateV1BlockStateCall{
+				{
+					Calls: calls,
+				},
+			},
+			TraceTransfers: true,
+			Validation:     false,
+		}
+
+		blockTag := cCtx.String("block")
+		if blockTag == "" {
+			blockTag = "latest"
+		}
+
+		result, err := h.MEVClient.SimulateV1(ctx, args, blockTag)
+		if err != nil {
+			return err
+		}
+
+		formatted, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(string(formatted))
+		return nil
 	}
 }
 
@@ -543,9 +653,9 @@ func (h *Handler) SendPrivateRelayTx(ctx context.Context) func(*cli.Context) err
 
 		resp, err := h.sendPrivateRelayTx(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("faield to execute send-private-tx error %w", err)
+			return fmt.Errorf("failed to execute send-private-tx error %w", err)
 		}
-		slog.Info("Resposne:", "resp", resp.String())
+		slog.Info("Response", "resp", resp.String())
 
 		return nil
 	}
@@ -565,10 +675,11 @@ func (h *Handler) SendFakeTx(ctx context.Context) func(*cli.Context) error {
 	return func(cCtx *cli.Context) error {
 		tx, err := h.sendFakeTx(ctx, nil, h.DefaultPriorityFee)
 		if err != nil {
-			return fmt.Errorf("faield to execute send-private-tx error %w", err)
+			return fmt.Errorf("failed to execute send-private-tx error %w", err)
 		}
 
 		slog.Info("Send fake tx which must fail", "tx_hash", tx.Hash())
+		h.getFlashbotsTxReceipt(ctx, tx.Hash())
 
 		return nil
 	}
@@ -596,23 +707,14 @@ func (h *Handler) sendFakeTx(ctx context.Context, sender *ecdsa.PrivateKey, prio
 	}
 
 	signer := types.LatestSignerForChainID(h.MEVClient.ChainID)
-	gasPrice := currBlock.BaseFee()
-	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(110))
-	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
-	gasLimit := 80_000
+	fees := calcTxFees(currBlock.BaseFee(), 110, priorityFee)
 
-	var gasTipCap *big.Int
-	if priorityFee != nil {
-		gasTipCap = priorityFee
-	} else {
-		gasTipCap = big.NewInt(1e5)
-	}
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   h.MEVClient.ChainID,
 		Nonce:     nonce,
-		GasFeeCap: baseFeeFuture,
-		GasTipCap: gasTipCap,
-		Gas:       uint64(gasLimit),
+		GasFeeCap: fees.gasFeeCap,
+		GasTipCap: fees.gasTipCap,
+		Gas:       80_000,
 		To:        &h.CheckAndSendContract,
 		Value:     nil,
 		Data:      fakeCalldata,
@@ -679,25 +781,14 @@ func (h *Handler) SendBackrun(ctx context.Context, originalTx common.Hash, prior
 	}
 
 	signer := types.LatestSignerForChainID(h.MEVClient.ChainID)
-	gasPrice := currBlock.BaseFee()
-	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(110))
-	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
-	gasLimit := 80_000
-
-	var gasTipCap *big.Int
-	if priorityFee != nil {
-		gasTipCap = priorityFee
-	} else {
-		gasTipCap = big.NewInt(1e5)
-	}
-	baseFeeFuture.Add(baseFeeFuture, gasTipCap)
+	fees := calcTxFees(currBlock.BaseFee(), 110, priorityFee)
 
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   h.MEVClient.ChainID,
 		Nonce:     nonce,
-		GasFeeCap: baseFeeFuture,
-		GasTipCap: gasTipCap,
-		Gas:       uint64(gasLimit),
+		GasFeeCap: fees.gasFeeCap,
+		GasTipCap: fees.gasTipCap,
+		Gas:       80_000,
 		To:        &h.CheckAndSendContract,
 		Value:     payableAmount,
 		Data:      calldata,
@@ -730,10 +821,10 @@ func (h *Handler) getFlashbotsTxReceipt(ctx context.Context, tx common.Hash) (pr
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return protect.TxStatus{}, err
 			}
-			slog.Warn("Failed to get tx status", "erorr", err)
+			slog.Warn("Failed to get tx status", "error", err)
 			continue
 		}
-
+		slog.Info("Check flashbots tx status", "status", txStatus.Status)
 		if txStatus.Status == Pending {
 			continue
 		}
@@ -880,7 +971,7 @@ VerifyLoop:
 			}
 			delegation := types.AddressToDelegation(auth.Address)
 			if string(code) != string(delegation) {
-				return fmt.Errorf("code is not equal expected delegation")
+				return fmt.Errorf("code is not equal to expected delegation")
 			}
 			break VerifyLoop
 		}
@@ -919,24 +1010,14 @@ VerifyLoop:
 	}
 
 	signer := types.LatestSignerForChainID(h.MEVClient.ChainID)
-	gasPrice := currBlock.BaseFee()
-	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(150))
-	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
-	gasLimit := 180_000
-
-	var gasTipCap *big.Int
-	if priorityFee != nil {
-		gasTipCap = priorityFee
-	} else {
-		gasTipCap = big.NewInt(1e5)
-	}
+	fees := calcTxFees(currBlock.BaseFee(), 150, priorityFee)
 
 	rawTx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   h.MEVClient.ChainID,
 		Nonce:     nonce,
-		GasTipCap: gasTipCap,
-		GasFeeCap: baseFeeFuture,
-		Gas:       uint64(gasLimit),
+		GasTipCap: fees.gasTipCap,
+		GasFeeCap: fees.gasFeeCap,
+		Gas:       180_000,
 		To:        &senderAddr,
 		Value:     nil,
 		Data:      calldata,
@@ -954,6 +1035,84 @@ VerifyLoop:
 	slog.Info("Sent batchcall-tx", "tx_hash", stx.Hash())
 	return nil
 
+}
+
+func TxSender(tx *types.Transaction) (common.Address, error) {
+	signer := types.LatestSignerForChainID(tx.ChainId())
+	sender, err := types.Sender(signer, tx)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to extract tx sender %w", err)
+	}
+
+	return sender, nil
+}
+
+func DecodeRawTx(rawTxHex string) ([]byte, error) {
+	rawTxBytes, err := hexutil.Decode(rawTxHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode raw-tx hex: %w", err)
+	}
+
+	var tx types.Transaction
+	if err := tx.UnmarshalBinary(rawTxBytes); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal raw transaction: %w", err)
+	}
+
+	sender, _ := TxSender(&tx)
+	slog.Info("Using provided raw tx", "txHash", tx.Hash(), "from", sender, "nonce", tx.Nonce(), "type", tx.Type())
+	return rawTxBytes, nil
+}
+
+// resolveRawTxs returns one or more raw transaction byte slices.
+// If --raw-tx is provided (one or more times), decodes and returns them.
+// Otherwise, generates a single simple test transaction.
+func (h *Handler) resolveRawTxs(ctx context.Context, cCtx *cli.Context) ([][]byte, error) {
+	if rawTxHexes := cCtx.StringSlice("raw-tx"); len(rawTxHexes) > 0 {
+		result := make([][]byte, 0, len(rawTxHexes))
+		for _, hex := range rawTxHexes {
+			raw, err := DecodeRawTx(hex)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, raw)
+		}
+		return result, nil
+	}
+
+	ethAmountStr := cCtx.String("eth-amount")
+	txTypeStr := TestTxType(cCtx.String("tx-type"))
+	toAddr, err := h.parseToAddr(txTypeStr)
+	if err != nil {
+		return nil, err
+	}
+
+	ethAmount, err := h.getEthValue(ethAmountStr)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := h.ethTransfer(ctx, ethAmount, h.DefaultPriorityFee, nil, toAddr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct ethTransfer tx error %w", err)
+	}
+
+	slog.Info("Tx hash for bundle", "txHash", tx.Hash())
+
+	rawTx, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal tx %w", err)
+	}
+
+	return [][]byte{rawTx}, nil
+}
+
+// resolveRawTx returns a single raw transaction (first from --raw-tx or generated).
+func (h *Handler) resolveRawTx(ctx context.Context, cCtx *cli.Context) ([]byte, error) {
+	txs, err := h.resolveRawTxs(ctx, cCtx)
+	if err != nil {
+		return nil, err
+	}
+	return txs[0], nil
 }
 
 func (h *Handler) getEthValue(value string) (*big.Int, error) {
@@ -987,45 +1146,41 @@ func (h *Handler) ethTransfer(ctx context.Context, value *big.Int, priorityFee *
 		key = sender
 	}
 
-	currBlock, err := h.MEVClient.FlashbotsRPC.BlockByNumber(ctx, nil)
+	currBlock, err := h.EthClient.BlockByNumber(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block error %w", err)
 	}
 
 	address := crypto.PubkeyToAddress(key.PublicKey)
 	if nonce == nil {
-		nonceAt, err := h.MEVClient.FlashbotsRPC.PendingNonceAt(ctx, address)
+		nonceAt, err := h.EthClient.PendingNonceAt(ctx, address)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get pending nonce: %w", err)
 		}
 		nonce = &nonceAt
 	}
 
+	slog.Info("nonce for tx", "nonce", *nonce)
+
 	signer := types.LatestSignerForChainID(h.MEVClient.ChainID)
-	gasPrice := currBlock.BaseFee()
-	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(150))
-	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
+	fees := calcTxFees(currBlock.BaseFee(), 150, priorityFee)
 
-	gasLimit := 50_000
-	var gasTipCap *big.Int
-	if priorityFee != nil {
-		gasTipCap = priorityFee
-	} else {
-		gasTipCap = big.NewInt(1e5)
-	}
-	baseFeeFuture.Add(baseFeeFuture, gasTipCap)
+	slog.Info("tx fee params", "gasFeeCap", fees.gasFeeCap.String(), "gasTipCap", fees.gasTipCap.String())
 
-	log.Println("baseFee:", baseFeeFuture.String(), "priorityFee:", gasTipCap.String())
-
-	return types.SignTx(types.NewTx(&types.DynamicFeeTx{
+	tx, err := types.SignTx(types.NewTx(&types.DynamicFeeTx{
 		ChainID:   h.MEVClient.ChainID,
 		Nonce:     *nonce,
-		GasFeeCap: baseFeeFuture,
-		GasTipCap: gasTipCap,
-		Gas:       uint64(gasLimit),
+		GasFeeCap: fees.gasFeeCap,
+		GasTipCap: fees.gasTipCap,
+		Gas:       50_000,
 		To:        &to,
 		Value:     value,
 	}), signer, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct and sign tx %w", err)
+	}
+
+	return tx, err
 }
 
 type Call struct {
@@ -1065,24 +1220,14 @@ func (h *Handler) delegateTxWithEIP7702(ctx context.Context, sender *ecdsa.Priva
 	}
 
 	signer := types.LatestSignerForChainID(h.MEVClient.ChainID)
-	gasPrice := currBlock.BaseFee()
-	baseFeeFuture := new(big.Int).Mul(gasPrice, big.NewInt(150))
-	baseFeeFuture = new(big.Int).Div(baseFeeFuture, big.NewInt(100))
-	gasLimit := 180_000
-
-	var gasTipCap *big.Int
-	if priorityFee != nil {
-		gasTipCap = priorityFee
-	} else {
-		gasTipCap = big.NewInt(1e5)
-	}
+	fees := calcTxFees(currBlock.BaseFee(), 150, priorityFee)
 
 	rawTx := types.NewTx(&types.SetCodeTx{
 		ChainID:   uint256.MustFromBig(h.MEVClient.ChainID),
 		Nonce:     *nonce,
-		GasTipCap: uint256.MustFromBig(gasTipCap),
-		GasFeeCap: uint256.MustFromBig(baseFeeFuture),
-		Gas:       uint64(gasLimit),
+		GasTipCap: uint256.MustFromBig(fees.gasTipCap),
+		GasFeeCap: uint256.MustFromBig(fees.gasFeeCap),
+		Gas:       180_000,
 		To:        senderAddr,
 		Value:     nil,
 		Data:      []byte("hello!"),

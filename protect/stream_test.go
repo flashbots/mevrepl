@@ -98,5 +98,4 @@ func (s sseMockServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	<-time.After(time.Millisecond * 100)
 
 	s.cancel()
-	return
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/flashbots/go-utils/rpcclient"
 	"github.com/flashbots/go-utils/rpctypes"
 	"github.com/flashbots/go-utils/signature"
@@ -28,8 +29,8 @@ const (
 )
 
 const (
-	defaultAPIVersion     = "v0.1"
-	defaultValidityBlocks = 25
+	DefaultAPIVersion     = "v0.1"
+	DefaultValidityBlocks = 25
 )
 
 const (
@@ -65,11 +66,13 @@ type Client struct {
 }
 
 type ClientOpts struct {
-	RPCOpts          string
-	HTTPClient       *http.Client
-	FlashbotsRPC     string
-	FlashbotsRelay   string
-	FlashbotsProtect string
+	RPCOpts           string
+	HTTPClient        *http.Client
+	FlashbotsRPC      string
+	FlashbotsRelay    string
+	FlashbotsProtect  string
+	FlashbotsMEVShare string
+	ChainID           *big.Int
 }
 
 func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientOpts) (*Client, error) {
@@ -79,6 +82,7 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 			HTTPClient: http.DefaultClient,
 		}
 	}
+
 	var (
 		flashbotsRPCURL      string
 		flashbotsRelayURL    string
@@ -101,7 +105,7 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 		flashbotsProtectURL = FlashbotsSepoliaProtect
 		chainID = big.NewInt(SepoliaChainID)
 	default:
-		return nil, ErrUnsupportedNetwork
+		// custom/devnet network — all URLs and chain ID must come from opts
 	}
 
 	if opts.FlashbotsProtect != "" {
@@ -117,6 +121,25 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 		flashbotsRelayURL = opts.FlashbotsRelay
 	}
 
+	if opts.FlashbotsMEVShare != "" {
+		flashbotsMEVShareURL = opts.FlashbotsMEVShare
+	}
+
+	if opts.ChainID != nil {
+		chainID = opts.ChainID
+	}
+
+	// validate required fields
+	if flashbotsRPCURL == "" {
+		return nil, fmt.Errorf("flashbots RPC URL is required (use --flashbots-rpc or FLASHBOTS_RPC_URL)")
+	}
+	if flashbotsRelayURL == "" {
+		return nil, fmt.Errorf("flashbots relay URL is required (use --flashbots-relay or FLASHBOTS_RELAY_URL)")
+	}
+	if chainID == nil {
+		return nil, fmt.Errorf("chain ID is required for custom networks (use --chain-id or CHAIN_ID)")
+	}
+
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = http.DefaultClient
 	}
@@ -125,11 +148,13 @@ func ConstructClient(privateKey *ecdsa.PrivateKey, network string, opts *ClientO
 	if opts.RPCOpts != "" {
 		url = flashbotsRPCURL + "/" + opts.RPCOpts
 	}
-	flashbotsRPCClient, err := ethclient.Dial(url)
+
+	rpcClient, err := rpc.DialOptions(context.Background(), url)
 	if err != nil {
 		return nil, err
 	}
 
+	flashbotsRPCClient := ethclient.NewClient(rpcClient)
 	signer := signature.NewSigner(privateKey)
 	relayClient := rpcclient.NewClientWithOpts(flashbotsRelayURL, &rpcclient.RPCClientOpts{Signer: &signer})
 
@@ -150,7 +175,7 @@ func (c *Client) CreateMEVBundle(originalHash common.Hash, block uint64, opts *B
 	}
 
 	if opts == nil {
-		opts = &BundleOpts{ValidityBlocks: defaultValidityBlocks}
+		opts = &BundleOpts{ValidityBlocks: DefaultValidityBlocks}
 	}
 
 	inclusion := rpctypes.MevBundleInclusion{
@@ -159,7 +184,7 @@ func (c *Client) CreateMEVBundle(originalHash common.Hash, block uint64, opts *B
 	}
 
 	bundle := &rpctypes.MevSendBundleArgs{
-		Version:   defaultAPIVersion,
+		Version:   DefaultAPIVersion,
 		Inclusion: inclusion,
 		Body: []rpctypes.MevBundleBody{
 			{
@@ -197,7 +222,7 @@ func (c *Client) SendEthBundle(ctx context.Context, bundle *SendBundleArgs) (*Se
 	var bundleResp SendMevBundleResponse
 	err := c.FlashbotsRelay.CallFor(ctx, &bundleResp, "eth_sendBundle", bundle)
 	if err != nil {
-		return nil, fmt.Errorf("failed to call mev_sendBundle error %w", err)
+		return nil, fmt.Errorf("failed to call eth_sendBundle: %w", err)
 	}
 
 	return &bundleResp, nil
@@ -207,7 +232,7 @@ func (c *Client) SimulateMEVBundle(ctx context.Context, bundle *rpctypes.MevSend
 	var bundleSimResp SimulateBundleResponse
 	err := c.FlashbotsRelay.CallFor(ctx, &bundleSimResp, "mev_simBundle", bundle)
 	if err != nil {
-		return nil, fmt.Errorf("failed to call mev_sendBundle error %w", err)
+		return nil, fmt.Errorf("failed to call mev_simBundle: %w", err)
 	}
 
 	return &bundleSimResp, nil
@@ -268,6 +293,17 @@ func (c *Client) SendPrivateRelayTx(ctx context.Context, tx *types.Transaction) 
 
 	args := SendPrivateTxArgs{
 		Tx: rtx.String(),
+		Preferences: PrivateTxPreferences{
+			BlockRange: 0,
+			Validity: TxValidityPreferences{
+				Refund: []RefundConfig{
+					{
+						Address: common.Address{},
+						Percent: 50,
+					},
+				},
+			},
+		},
 	}
 
 	err = c.FlashbotsRelay.CallFor(ctx, &resp, "eth_sendPrivateTransaction", args)
@@ -297,6 +333,16 @@ func (c *Client) CallEthBundle(ctx context.Context, args *CallBundleArgs) error 
 	}
 
 	return nil
+}
+
+func (c *Client) SimulateV1(ctx context.Context, args *SimulateV1Args, blockTag string) (json.RawMessage, error) {
+	var result json.RawMessage
+	err := c.FlashbotsRPC.Client().CallContext(ctx, &result, "eth_simulateV1", args, blockTag)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call eth_simulateV1: %w", err)
+	}
+
+	return result, nil
 }
 
 func (c *Client) CancelPrivateRelayTx(ctx context.Context, txHash common.Hash) error {
