@@ -60,7 +60,7 @@ type Handler struct {
 	DefaultPriorityFee          *big.Int
 }
 
-const defaultPriorityFee = 1e5 // 100,000 wei
+const defaultPriorityFee = 500e9
 
 type txFeeParams struct {
 	gasFeeCap *big.Int
@@ -486,15 +486,20 @@ func (h *Handler) SendMEVBundle(ctx context.Context) func(*cli.Context) error {
 			return err
 		}
 
+		slog.Info("Current block", "block", currBlock.Number.Uint64())
+
 		rawTx, err := h.resolveRawTx(ctx, cCtx)
 		if err != nil {
 			return err
 		}
 
+		blockNumber := max(currBlock.Number.Uint64()+1, 4)
 		inclusion := rpctypes.MevBundleInclusion{
-			BlockNumber: hexutil.Uint64(currBlock.Number.Uint64() + 1),
-			MaxBlock:    hexutil.Uint64(currBlock.Number.Uint64() + 2),
+			BlockNumber: hexutil.Uint64(blockNumber),
+			MaxBlock:    hexutil.Uint64(blockNumber + 5),
 		}
+
+		slog.Info("Inclusion info", "blockNumber", uint64(inclusion.BlockNumber), "maxBlock", uint64(inclusion.MaxBlock))
 
 		bundle := &rpctypes.MevSendBundleArgs{
 			Version:   protect.DefaultAPIVersion,
@@ -1163,7 +1168,7 @@ func (h *Handler) ethTransfer(ctx context.Context, value *big.Int, priorityFee *
 	slog.Info("nonce for tx", "nonce", *nonce)
 
 	signer := types.LatestSignerForChainID(h.MEVClient.ChainID)
-	fees := calcTxFees(currBlock.BaseFee(), 150, priorityFee)
+	fees := calcTxFees(currBlock.BaseFee(), 250, priorityFee)
 
 	slog.Info("tx fee params", "gasFeeCap", fees.gasFeeCap.String(), "gasTipCap", fees.gasTipCap.String())
 
