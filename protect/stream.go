@@ -153,7 +153,8 @@ func (stream *Stream) subscribe(ctx context.Context) error {
 
 				var hint Hint
 				if err := json.Unmarshal(payload, &hint); err != nil {
-					panic(fmt.Errorf("failed to unmarshal hint object error %w", err))
+					slog.Debug("Failed to unmarshal hint object", "payload", string(payload), "err", err)
+					continue
 				}
 				stream.hintsC <- hint
 			}
