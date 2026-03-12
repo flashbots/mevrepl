@@ -156,7 +156,12 @@ func (stream *Stream) subscribe(ctx context.Context) error {
 					slog.Debug("Failed to unmarshal hint object", "payload", string(payload), "err", err)
 					continue
 				}
-				stream.hintsC <- hint
+				select {
+				case stream.hintsC <- hint:
+				case <-ctx.Done():
+					_ = resp.Body.Close()
+					return
+				}
 			}
 
 			_ = resp.Body.Close()
@@ -175,8 +180,9 @@ func (stream *Stream) subscribe(ctx context.Context) error {
 				slog.Debug("Failed to scan. Reader closed some data can be lost.", "error", readerErr)
 			}
 
-			// readerErr is nil (EOF occurred reading data from resp body)
-			// means connection closed by server. Reconnecting
+			if ctx.Err() != nil {
+				return
+			}
 			resp, err = conn()
 			if err != nil {
 				stream.connErr.Store(err)
